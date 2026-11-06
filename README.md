@@ -4,10 +4,10 @@ A tiny macOS menu bar app (Rust, native AppKit) for stashing Hacker News stories
 
 - Click the newspaper icon: the current top 15 stories are fetched.
 - Click a story: it's saved to the **Saved** submenu (checkmark shows it's saved; click again to unsave).
-- Option-click a story: open it now.
+- Option-click a story: open it now (also recorded in History).
 - In **Saved**, click a story to open it and remove it from the list. Option-click opens the HN comments.
 
-Saved stories live in `~/Library/Application Support/hn-stash/saved.json`.
+Saved stories and history live in `~/Library/Application Support/hn-stash/` (`saved.json`, `history.json`).
 
 ## Install
 

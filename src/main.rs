@@ -2,7 +2,7 @@
 //!
 //! Click the icon to fetch the current Hacker News top stories. Click a story
 //! to stash it in "Saved" for later (Option-click opens it right away).
-//! Clicking a saved story opens it in the browser and removes it from the list.
+//! Clicking a saved story opens it in the browser and moves it to "History".
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -12,16 +12,18 @@ use std::time::Duration;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{MainThreadOnly, define_class, msg_send, sel};
+use objc2::{AnyThread, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff, NSControlStateValueOn,
     NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
     NSVariableStatusItemLength, NSWorkspace,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString, NSURL, ns_string};
+use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSObjectProtocol, NSString, NSURL, ns_string};
 use serde::{Deserialize, Serialize};
 
 const STORY_COUNT: usize = 15;
+const HISTORY_LIMIT: usize = 100;
+const ICON_SVG: &[u8] = include_bytes!("../packaging/icon.svg");
 const API: &str = "https://hacker-news.firebaseio.com/v0";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +56,7 @@ struct Item {
 struct State {
     stories: Vec<Story>,
     saved: Vec<Story>,
+    history: Vec<Story>,
     error: Option<String>,
     menu: Option<Retained<NSMenu>>,
     target: Option<Retained<Handler>>,
@@ -68,24 +71,24 @@ static FETCHING: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------- storage
 
-fn saved_path() -> PathBuf {
+fn data_path(name: &str) -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/hn-stash/saved.json")
+    PathBuf::from(home).join("Library/Application Support/hn-stash").join(name)
 }
 
-fn load_saved() -> Vec<Story> {
-    std::fs::read(saved_path())
+fn load_list(name: &str) -> Vec<Story> {
+    std::fs::read(data_path(name))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn store_saved(saved: &[Story]) {
-    let path = saved_path();
+fn store_list(name: &str, list: &[Story]) {
+    let path = data_path(name);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(json) = serde_json::to_vec_pretty(saved) {
+    if let Ok(json) = serde_json::to_vec_pretty(list) {
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, json).is_ok() {
             let _ = std::fs::rename(tmp, path);
@@ -232,7 +235,7 @@ fn rebuild_menu() {
             for (i, st) in s.saved.iter().enumerate() {
                 let it = item(mtm, &short(&st.title, 70), Some(sel!(openSaved:)), i as isize, target);
                 it.setToolTip(Some(&NSString::from_str(&format!(
-                    "{}\nClick to open and remove · Option-click to open comments",
+                    "{}\nClick to open (moves to History) · Option-click to open comments",
                     domain(&st.url)
                 ))));
                 sub.addItem(&it);
@@ -253,6 +256,36 @@ fn rebuild_menu() {
         }
         saved_item.setSubmenu(Some(&sub));
         menu.addItem(&saved_item);
+
+        // History submenu
+        let hist_item = item(mtm, "History", None, 0, target);
+        let hsub = NSMenu::new(mtm);
+        if s.history.is_empty() {
+            hsub.addItem(&info(mtm, "Nothing read yet", target));
+        } else {
+            for (i, st) in s.history.iter().enumerate() {
+                let it = item(mtm, &short(&st.title, 70), Some(sel!(openHistory:)), i as isize, target);
+                it.setToolTip(Some(&NSString::from_str(&format!(
+                    "{}\nClick to open again · Option-click to open comments",
+                    domain(&st.url)
+                ))));
+                hsub.addItem(&it);
+                let alt = item(
+                    mtm,
+                    &format!("Comments: {}", short(&st.title, 60)),
+                    Some(sel!(openHistoryComments:)),
+                    i as isize,
+                    target,
+                );
+                alt.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
+                alt.setAlternate(true);
+                hsub.addItem(&alt);
+            }
+            hsub.addItem(&NSMenuItem::separatorItem(mtm));
+            hsub.addItem(&item(mtm, "Clear History", Some(sel!(clearHistory:)), 0, target));
+        }
+        hist_item.setSubmenu(Some(&hsub));
+        menu.addItem(&hist_item);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         // Top stories
@@ -297,12 +330,29 @@ fn open_url(url: &str) {
     }
 }
 
-fn with_saved(f: impl FnOnce(&mut Vec<Story>, &[Story])) {
+struct Lists<'a> {
+    saved: &'a mut Vec<Story>,
+    history: &'a mut Vec<Story>,
+    stories: &'a [Story],
+}
+
+impl Lists<'_> {
+    /// Open a story and record it at the top of History.
+    fn read(&mut self, st: Story) {
+        open_url(&st.url);
+        self.history.retain(|x| x.id != st.id);
+        self.history.insert(0, st);
+        self.history.truncate(HISTORY_LIMIT);
+    }
+}
+
+fn with_lists(f: impl FnOnce(&mut Lists)) {
     STATE.with_borrow_mut(|s| {
         let stories = std::mem::take(&mut s.stories);
-        f(&mut s.saved, &stories);
+        f(&mut Lists { saved: &mut s.saved, history: &mut s.history, stories: &stories });
         s.stories = stories;
-        store_saved(&s.saved);
+        store_list("saved.json", &s.saved);
+        store_list("history.json", &s.history);
     });
     rebuild_menu();
 }
@@ -328,12 +378,12 @@ define_class!(
         #[unsafe(method(toggleSave:))]
         fn toggle_save(&self, sender: &NSMenuItem) {
             let i = sender.tag() as usize;
-            with_saved(|saved, stories| {
-                if let Some(st) = stories.get(i) {
-                    if let Some(pos) = saved.iter().position(|x| x.id == st.id) {
-                        saved.remove(pos);
+            with_lists(|l| {
+                if let Some(st) = l.stories.get(i) {
+                    if let Some(pos) = l.saved.iter().position(|x| x.id == st.id) {
+                        l.saved.remove(pos);
                     } else {
-                        saved.push(st.clone());
+                        l.saved.push(st.clone());
                     }
                 }
             });
@@ -342,18 +392,21 @@ define_class!(
         #[unsafe(method(openStory:))]
         fn open_story(&self, sender: &NSMenuItem) {
             let i = sender.tag() as usize;
-            let url = STATE.with_borrow(|s| s.stories.get(i).map(|x| x.url.clone()));
-            if let Some(url) = url {
-                open_url(&url);
-            }
+            with_lists(|l| {
+                if let Some(st) = l.stories.get(i).cloned() {
+                    l.saved.retain(|x| x.id != st.id);
+                    l.read(st);
+                }
+            });
         }
 
         #[unsafe(method(openSaved:))]
         fn open_saved(&self, sender: &NSMenuItem) {
             let i = sender.tag() as usize;
-            with_saved(|saved, _| {
-                if i < saved.len() {
-                    open_url(&saved.remove(i).url);
+            with_lists(|l| {
+                if i < l.saved.len() {
+                    let st = l.saved.remove(i);
+                    l.read(st);
                 }
             });
         }
@@ -369,16 +422,40 @@ define_class!(
 
         #[unsafe(method(openAllSaved:))]
         fn open_all_saved(&self, _sender: &NSMenuItem) {
-            with_saved(|saved, _| {
-                for st in saved.drain(..) {
-                    open_url(&st.url);
+            with_lists(|l| {
+                for st in std::mem::take(l.saved) {
+                    l.read(st);
                 }
             });
         }
 
         #[unsafe(method(clearSaved:))]
         fn clear_saved(&self, _sender: &NSMenuItem) {
-            with_saved(|saved, _| saved.clear());
+            with_lists(|l| l.saved.clear());
+        }
+
+        #[unsafe(method(openHistory:))]
+        fn open_history(&self, sender: &NSMenuItem) {
+            let i = sender.tag() as usize;
+            with_lists(|l| {
+                if let Some(st) = l.history.get(i).cloned() {
+                    l.read(st);
+                }
+            });
+        }
+
+        #[unsafe(method(openHistoryComments:))]
+        fn open_history_comments(&self, sender: &NSMenuItem) {
+            let i = sender.tag() as usize;
+            let url = STATE.with_borrow(|s| s.history.get(i).map(|x| x.discussion_url()));
+            if let Some(url) = url {
+                open_url(&url);
+            }
+        }
+
+        #[unsafe(method(clearHistory:))]
+        fn clear_history(&self, _sender: &NSMenuItem) {
+            with_lists(|l| l.history.clear());
         }
 
         #[unsafe(method(openHN:))]
@@ -411,21 +488,19 @@ fn main() {
 
     let status_item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = status_item.button(mtm) {
-        match NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            ns_string!("newspaper"),
-            Some(ns_string!("HN Stash")),
-        ) {
+        match NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(ICON_SVG)) {
             Some(img) => {
-                img.setTemplate(true);
+                img.setSize(NSSize::new(18.0, 18.0));
                 button.setImage(Some(&img));
             }
-            None => button.setTitle(ns_string!("HN")),
+            None => button.setTitle(ns_string!("Y")),
         }
     }
     status_item.setMenu(Some(&menu));
 
     STATE.with_borrow_mut(|s| {
-        s.saved = load_saved();
+        s.saved = load_list("saved.json");
+        s.history = load_list("history.json");
         s.menu = Some(menu);
         s.target = Some(handler);
         s._status_item = Some(status_item);
