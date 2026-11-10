@@ -1,7 +1,8 @@
 //! HN Stash: a tiny macOS menu bar app.
 //!
 //! Click the icon to fetch the current Hacker News top stories. Click a story
-//! to stash it in "Saved" for later (Option-click opens it right away).
+//! to stash it in "Saved" for later (right-click or Option-click opens it right away).
+//! Middle-click a story in any list to open its Hacker News comments.
 //! Clicking a saved story opens it in the browser and moves it to "History".
 
 use std::cell::RefCell;
@@ -15,7 +16,7 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{AnyThread, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff, NSControlStateValueOn,
-    NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
     NSVariableStatusItemLength, NSWorkspace,
 };
 use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSObjectProtocol, NSString, NSURL, ns_string};
@@ -235,7 +236,7 @@ fn rebuild_menu() {
             for (i, st) in s.saved.iter().enumerate() {
                 let it = item(mtm, &short(&st.title, 70), Some(sel!(openSaved:)), i as isize, target);
                 it.setToolTip(Some(&NSString::from_str(&format!(
-                    "{}\nClick to open (moves to History) · Option-click to open comments",
+                    "{}\nClick to open (moves to History) · Middle-click or Option-click to open comments",
                     domain(&st.url)
                 ))));
                 sub.addItem(&it);
@@ -266,7 +267,7 @@ fn rebuild_menu() {
             for (i, st) in s.history.iter().enumerate() {
                 let it = item(mtm, &short(&st.title, 70), Some(sel!(openHistory:)), i as isize, target);
                 it.setToolTip(Some(&NSString::from_str(&format!(
-                    "{}\nClick to open again · Option-click to open comments",
+                    "{}\nClick to open again · Middle-click or Option-click to open comments",
                     domain(&st.url)
                 ))));
                 hsub.addItem(&it);
@@ -300,7 +301,7 @@ fn rebuild_menu() {
             let is_saved = s.saved.iter().any(|x| x.id == st.id);
             it.setState(if is_saved { NSControlStateValueOn } else { NSControlStateValueOff });
             it.setToolTip(Some(&NSString::from_str(&format!(
-                "{} · {} points · {} comments\nClick to save for later · Option-click to open now",
+                "{} · {} points · {} comments\nClick to save for later · Right-click or Option-click to open now · Middle-click for comments",
                 domain(&st.url),
                 st.score,
                 st.comments
@@ -359,6 +360,13 @@ fn with_lists(f: impl FnOnce(&mut Lists)) {
 
 // ---------------------------------------------------------------- handler
 
+fn is_middle_click(mtm: MainThreadMarker) -> bool {
+    NSApplication::sharedApplication(mtm).currentEvent().is_some_and(|event| {
+        matches!(event.r#type(), NSEventType::OtherMouseDown | NSEventType::OtherMouseUp)
+            && event.buttonNumber() == 2
+    })
+}
+
 define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
@@ -377,6 +385,20 @@ define_class!(
     impl Handler {
         #[unsafe(method(toggleSave:))]
         fn toggle_save(&self, sender: &NSMenuItem) {
+            if is_middle_click(self.mtm()) {
+                self.open_story_comments(sel!(openStoryComments:), sender);
+                return;
+            }
+            // Menu tracking delivers secondary clicks to the item's normal action.
+            // Inspect that event here, rather than using an event monitor (which
+            // does not receive events consumed by AppKit's menu tracking loop).
+            let app = NSApplication::sharedApplication(self.mtm());
+            if app.currentEvent().is_some_and(|event| {
+                matches!(event.r#type(), NSEventType::RightMouseDown | NSEventType::RightMouseUp)
+            }) {
+                self.open_story(sel!(openStory:), sender);
+                return;
+            }
             let i = sender.tag() as usize;
             with_lists(|l| {
                 if let Some(st) = l.stories.get(i) {
@@ -391,6 +413,10 @@ define_class!(
 
         #[unsafe(method(openStory:))]
         fn open_story(&self, sender: &NSMenuItem) {
+            if is_middle_click(self.mtm()) {
+                self.open_story_comments(sel!(openStoryComments:), sender);
+                return;
+            }
             let i = sender.tag() as usize;
             with_lists(|l| {
                 if let Some(st) = l.stories.get(i).cloned() {
@@ -400,8 +426,21 @@ define_class!(
             });
         }
 
+        #[unsafe(method(openStoryComments:))]
+        fn open_story_comments(&self, sender: &NSMenuItem) {
+            let i = sender.tag() as usize;
+            let url = STATE.with_borrow(|s| s.stories.get(i).map(|x| x.discussion_url()));
+            if let Some(url) = url {
+                open_url(&url);
+            }
+        }
+
         #[unsafe(method(openSaved:))]
         fn open_saved(&self, sender: &NSMenuItem) {
+            if is_middle_click(self.mtm()) {
+                self.open_saved_comments(sel!(openSavedComments:), sender);
+                return;
+            }
             let i = sender.tag() as usize;
             with_lists(|l| {
                 if i < l.saved.len() {
@@ -436,6 +475,10 @@ define_class!(
 
         #[unsafe(method(openHistory:))]
         fn open_history(&self, sender: &NSMenuItem) {
+            if is_middle_click(self.mtm()) {
+                self.open_history_comments(sel!(openHistoryComments:), sender);
+                return;
+            }
             let i = sender.tag() as usize;
             with_lists(|l| {
                 if let Some(st) = l.history.get(i).cloned() {
