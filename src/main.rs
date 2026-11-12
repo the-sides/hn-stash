@@ -5,21 +5,29 @@
 //! Middle-click a story in any list to open its Hacker News comments.
 //! Clicking a saved story opens it in the browser and moves it to "History".
 
-use std::cell::RefCell;
+mod cloud;
+
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{AnyThread, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff, NSControlStateValueOn,
-    NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
-    NSVariableStatusItemLength, NSWorkspace,
+    NSApplication, NSApplicationActivationPolicy, NSBezierPath, NSButton, NSColor,
+    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSEventType,
+    NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSStringDrawing, NSTextAlignment, NSTrackingArea,
+    NSTrackingAreaOptions, NSVariableStatusItemLength, NSView, NSWorkspace,
+    NSWorkspaceOpenConfiguration,
 };
-use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSObjectProtocol, NSString, NSURL, ns_string};
+use objc2_foundation::{
+    MainThreadMarker, NSData, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSURL, ns_string,
+};
 use serde::{Deserialize, Serialize};
 
 const STORY_COUNT: usize = 15;
@@ -56,9 +64,14 @@ struct Item {
 #[derive(Default)]
 struct State {
     stories: Vec<Story>,
+    pending_stories: Option<Vec<Story>>,
     saved: Vec<Story>,
     history: Vec<Story>,
     error: Option<String>,
+    connection: Option<cloud::Connection>,
+    cloud_status: String,
+    cloud_sync: cloud::SyncSchedule,
+    cloud_enabled: bool,
     menu: Option<Retained<NSMenu>>,
     target: Option<Retained<Handler>>,
     _status_item: Option<Retained<NSStatusItem>>,
@@ -68,13 +81,18 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
 
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+static BACKING_UP: AtomicBool = AtomicBool::new(false);
+
 static FETCHING: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------- storage
 
 fn data_path(name: &str) -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/hn-stash").join(name)
+    PathBuf::from(home)
+        .join("Library/Application Support/hn-stash")
+        .join(name)
 }
 
 fn load_list(name: &str) -> Vec<Story> {
@@ -84,17 +102,68 @@ fn load_list(name: &str) -> Vec<Story> {
         .unwrap_or_default()
 }
 
-fn store_list(name: &str, list: &[Story]) {
+fn write_json(name: &str, value: &impl Serialize) -> Result<(), String> {
     let path = data_path(name);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    std::fs::create_dir_all(path.parent().ok_or("Missing data directory")?)
+        .map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::rename(tmp, path).map_err(|e| e.to_string())
+}
+
+fn store_list(name: &str, list: &[Story]) {
+    if let Err(error) = write_json(name, &list) {
+        STATE.with_borrow_mut(|s| s.error = Some(format!("Could not save locally: {error}")));
     }
-    if let Ok(json) = serde_json::to_vec_pretty(list) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(tmp, path);
+}
+
+fn start_backup(connect: bool) {
+    let snapshot = STATE.with_borrow_mut(|s| {
+        if connect {
+            s.cloud_enabled = true;
         }
-    }
+        if !s.cloud_enabled || !s.cloud_sync.begin(Instant::now(), connect) {
+            return None;
+        }
+        BACKING_UP.store(true, Ordering::SeqCst);
+        Some((s.connection.clone(), s.saved.clone(), s.history.clone()))
+    });
+    let Some((connection, saved, history)) = snapshot else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let result = cloud::backup(connection, &saved, &history);
+        DispatchQueue::main().exec_async(move || {
+            BACKING_UP.store(false, Ordering::SeqCst);
+            STATE.with_borrow_mut(|s| {
+                s.cloud_sync.finish(Instant::now(), result.is_ok());
+                match result {
+                    Ok(connection) => {
+                        s.cloud_status.clear();
+                        s.connection = Some(connection);
+                    }
+                    Err(error) => s.cloud_status = error,
+                }
+            });
+            rebuild_menu();
+        });
+    });
+}
+
+fn start_cloud_sync() {
+    start_backup(false);
+    // A timer, rather than menu activity, drives debounced uploads and retries.
+    // The worker always reads the latest in-memory lists on the main queue.
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            DispatchQueue::main().exec_async(|| start_backup(false));
+        }
+    });
 }
 
 // ---------------------------------------------------------------- network
@@ -157,7 +226,11 @@ fn start_fetch() {
             FETCHING.store(false, Ordering::SeqCst);
             STATE.with_borrow_mut(|s| match result {
                 Ok(stories) => {
-                    s.stories = stories;
+                    if MENU_OPEN.load(Ordering::SeqCst) {
+                        s.pending_stories = Some(stories);
+                    } else {
+                        s.stories = stories;
+                    }
                     s.error = None;
                 }
                 Err(e) => s.error = Some(e),
@@ -205,6 +278,20 @@ fn item(
         unsafe { it.setTarget(Some(t)) };
     }
     it.setTag(tag);
+    if let Some(action) = action
+        && [
+            sel!(toggleSave:),
+            sel!(openStory:),
+            sel!(openSaved:),
+            sel!(openHistory:),
+            sel!(openSavedComments:),
+            sel!(openHistoryComments:),
+        ]
+        .contains(&action)
+    {
+        let view = StoryButton::new(mtm, title, action, tag);
+        it.setView(Some(&view));
+    }
     it
 }
 
@@ -216,7 +303,9 @@ fn info(mtm: MainThreadMarker, title: &str, target: &Handler) -> Retained<NSMenu
 
 fn rebuild_menu() {
     let mtm = MainThreadMarker::new().expect("main thread");
-    STATE.with_borrow(|s| {
+    STATE.with_borrow_mut(|s| {
+        if MENU_OPEN.load(Ordering::SeqCst) { return; }
+        if let Some(stories) = s.pending_stories.take() { s.stories = stories; }
         let (Some(menu), Some(target)) = (&s.menu, &s.target) else {
             return;
         };
@@ -233,8 +322,8 @@ fn rebuild_menu() {
         if s.saved.is_empty() {
             sub.addItem(&info(mtm, "Nothing saved yet", target));
         } else {
-            for (i, st) in s.saved.iter().enumerate() {
-                let it = item(mtm, &short(&st.title, 70), Some(sel!(openSaved:)), i as isize, target);
+            for st in &s.saved {
+                let it = item(mtm, &short(&st.title, 70), Some(sel!(openSaved:)), st.id as isize, target);
                 it.setToolTip(Some(&NSString::from_str(&format!(
                     "{}\nClick to open (moves to History) · Middle-click or Option-click to open comments",
                     domain(&st.url)
@@ -244,7 +333,7 @@ fn rebuild_menu() {
                     mtm,
                     &format!("Comments: {}", short(&st.title, 60)),
                     Some(sel!(openSavedComments:)),
-                    i as isize,
+                    st.id as isize,
                     target,
                 );
                 alt.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
@@ -264,8 +353,8 @@ fn rebuild_menu() {
         if s.history.is_empty() {
             hsub.addItem(&info(mtm, "Nothing read yet", target));
         } else {
-            for (i, st) in s.history.iter().enumerate() {
-                let it = item(mtm, &short(&st.title, 70), Some(sel!(openHistory:)), i as isize, target);
+            for st in &s.history {
+                let it = item(mtm, &short(&st.title, 70), Some(sel!(openHistory:)), st.id as isize, target);
                 it.setToolTip(Some(&NSString::from_str(&format!(
                     "{}\nClick to open again · Middle-click or Option-click to open comments",
                     domain(&st.url)
@@ -275,7 +364,7 @@ fn rebuild_menu() {
                     mtm,
                     &format!("Comments: {}", short(&st.title, 60)),
                     Some(sel!(openHistoryComments:)),
-                    i as isize,
+                    st.id as isize,
                     target,
                 );
                 alt.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
@@ -296,10 +385,13 @@ fn rebuild_menu() {
         if let Some(err) = &s.error {
             menu.addItem(&info(mtm, &format!("Couldn't load: {}", short(err, 50)), target));
         }
-        for (i, st) in s.stories.iter().enumerate() {
-            let it = item(mtm, &short(&st.title, 70), Some(sel!(toggleSave:)), i as isize, target);
+        for st in &s.stories {
+            let it = item(mtm, &short(&st.title, 70), Some(sel!(toggleSave:)), st.id as isize, target);
             let is_saved = s.saved.iter().any(|x| x.id == st.id);
             it.setState(if is_saved { NSControlStateValueOn } else { NSControlStateValueOff });
+            if let Some(view) = it.view() {
+                unsafe { let _: () = msg_send![&*view, setStorySaved: is_saved]; }
+            }
             it.setToolTip(Some(&NSString::from_str(&format!(
                 "{} · {} points · {} comments\nClick to save for later · Right-click or Option-click to open now · Middle-click for comments",
                 domain(&st.url),
@@ -311,7 +403,7 @@ fn rebuild_menu() {
                 mtm,
                 &format!("Open now: {}", short(&st.title, 60)),
                 Some(sel!(openStory:)),
-                i as isize,
+                st.id as isize,
                 target,
             );
             alt.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
@@ -320,6 +412,28 @@ fn rebuild_menu() {
         }
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        if let Some(connection) = &s.connection {
+            menu.addItem(&item(mtm, "Open cloud stash", Some(sel!(openCloud:)), 0, target));
+            let account = item(mtm, "GitHub", None, 0, target);
+            let account_menu = NSMenu::new(mtm);
+            account_menu.setAutoenablesItems(false);
+            account_menu.addItem(&info(mtm, &connection.login, target));
+            if !s.cloud_status.is_empty() {
+                account_menu.addItem(&info(mtm, &short(&s.cloud_status, 80), target));
+                account_menu.addItem(&info(mtm, "Retrying automatically…", target));
+                account_menu.addItem(&item(mtm, "GitHub sign-in…", Some(sel!(signIn:)), 0, target));
+            }
+            let disconnect = item(mtm, "Disconnect GitHub", Some(sel!(disconnectCloud:)), 0, target);
+            disconnect.setEnabled(!BACKING_UP.load(Ordering::SeqCst));
+            account_menu.addItem(&disconnect);
+            account.setSubmenu(Some(&account_menu));
+            menu.addItem(&account);
+        } else {
+            if !s.cloud_status.is_empty() { menu.addItem(&info(mtm, &short(&s.cloud_status, 80), target)); }
+            menu.addItem(&item(mtm, "Connect GitHub", Some(sel!(connectCloud:)), 0, target));
+            menu.addItem(&item(mtm, "GitHub sign-in…", Some(sel!(signIn:)), 0, target));
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&item(mtm, "Open Hacker News", Some(sel!(openHN:)), 0, target));
         menu.addItem(&item(mtm, "Quit HN Stash", Some(sel!(quit:)), 0, target));
     });
@@ -327,7 +441,14 @@ fn rebuild_menu() {
 
 fn open_url(url: &str) {
     if let Some(u) = NSURL::URLWithString(&NSString::from_str(url)) {
-        NSWorkspace::sharedWorkspace().openURL(&u);
+        let configuration = NSWorkspaceOpenConfiguration::configuration();
+        // Keep menu tracking alive when opening several links in succession.
+        configuration.setActivates(!MENU_OPEN.load(Ordering::SeqCst));
+        NSWorkspace::sharedWorkspace().openURL_configuration_completionHandler(
+            &u,
+            &configuration,
+            None,
+        );
     }
 }
 
@@ -350,21 +471,243 @@ impl Lists<'_> {
 fn with_lists(f: impl FnOnce(&mut Lists)) {
     STATE.with_borrow_mut(|s| {
         let stories = std::mem::take(&mut s.stories);
-        f(&mut Lists { saved: &mut s.saved, history: &mut s.history, stories: &stories });
+        f(&mut Lists {
+            saved: &mut s.saved,
+            history: &mut s.history,
+            stories: &stories,
+        });
         s.stories = stories;
-        store_list("saved.json", &s.saved);
-        store_list("history.json", &s.history);
     });
+    let (saved, history) = STATE.with_borrow(|s| (s.saved.clone(), s.history.clone()));
+    store_list("saved.json", &saved);
+    store_list("history.json", &history);
+    refresh_story_views();
     rebuild_menu();
+    STATE.with_borrow_mut(|s| s.cloud_sync.changed(Instant::now()));
+    start_backup(false);
+}
+
+// Custom menu views receive clicks without ending AppKit menu tracking. Stable
+// story IDs keep Saved/History actions correct while those lists change in place.
+struct StoryButtonIvars {
+    action: Sel,
+    story_id: isize,
+    hovered: Cell<bool>,
+    saved: Cell<bool>,
+}
+
+define_class!(
+    #[unsafe(super = NSButton)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = StoryButtonIvars]
+    struct StoryButton;
+
+    unsafe impl NSObjectProtocol for StoryButton {}
+
+    impl StoryButton {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) { self.draw_menu_row(); }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(true);
+            NSView::setNeedsDisplay(self, true);
+        }
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(false);
+            NSView::setNeedsDisplay(self, true);
+        }
+        #[unsafe(method(setStorySaved:))]
+        fn set_story_saved(&self, saved: bool) {
+            self.ivars().saved.set(saved);
+            NSView::setNeedsDisplay(self, true);
+        }
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {}
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, _event: &NSEvent) {}
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, _event: &NSEvent) {}
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) { self.activate(event); }
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &NSEvent) { self.activate(event); }
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &NSEvent) {
+            if event.buttonNumber() == 2 { self.activate(event); }
+        }
+    }
+);
+
+impl StoryButton {
+    fn new(mtm: MainThreadMarker, title: &str, action: Sel, story_id: isize) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(StoryButtonIvars {
+            action,
+            story_id,
+            hovered: Cell::new(false),
+            saved: Cell::new(false),
+        });
+        let this: Retained<Self> = unsafe {
+            msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(610.0, 24.0))]
+        };
+        this.setTitle(&NSString::from_str(title));
+        this.setBordered(false);
+        this.setAlignment(NSTextAlignment::Left);
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                this.bounds(),
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::ActiveAlways
+                    | NSTrackingAreaOptions::InVisibleRect
+                    | NSTrackingAreaOptions::EnabledDuringMouseDrag,
+                Some(&this),
+                None,
+            )
+        };
+        this.addTrackingArea(&tracking);
+        this
+    }
+
+    fn draw_menu_row(&self) {
+        let bounds = self.bounds();
+        let highlighted = self.ivars().hovered.get()
+            || self
+                .enclosingMenuItem()
+                .is_some_and(|item| item.isHighlighted());
+        if highlighted {
+            NSColor::selectedContentBackgroundColor().setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                NSRect::new(
+                    NSPoint::new(5.0, 1.0),
+                    NSSize::new(
+                        (bounds.size.width - 10.0).max(0.0),
+                        bounds.size.height - 2.0,
+                    ),
+                ),
+                4.0,
+                4.0,
+            )
+            .fill();
+        }
+        // NSButton's inactive-window drawing dims text in a status menu. Draw
+        // with semantic menu colors instead, using a separate checkmark column.
+        let color = if highlighted {
+            NSColor::selectedMenuItemTextColor()
+        } else {
+            NSColor::labelColor()
+        };
+        let font = NSFont::menuFontOfSize(0.0);
+        let attributes = unsafe {
+            NSDictionary::from_slices(
+                &[NSFontAttributeName, NSForegroundColorAttributeName],
+                &[&*font as &AnyObject, &*color as &AnyObject],
+            )
+        };
+        let title = self.title();
+        unsafe {
+            let height = title.sizeWithAttributes(Some(&attributes)).height;
+            let y = ((bounds.size.height - height) / 2.0).round();
+            title.drawInRect_withAttributes(
+                NSRect::new(
+                    NSPoint::new(22.0, y),
+                    NSSize::new((bounds.size.width - 36.0).max(0.0), height),
+                ),
+                Some(&attributes),
+            );
+            if self.ivars().saved.get() {
+                ns_string!("✓").drawAtPoint_withAttributes(NSPoint::new(7.0, y), Some(&attributes));
+            }
+        }
+    }
+
+    fn activate(&self, event: &NSEvent) {
+        if !self.isEnabled() {
+            return;
+        }
+        let point = self.convertPoint_fromView(event.locationInWindow(), None);
+        let bounds = self.bounds();
+        if point.x < 0.0
+            || point.y < 0.0
+            || point.x > bounds.size.width
+            || point.y > bounds.size.height
+        {
+            return;
+        }
+        let target = STATE.with_borrow(|s| s.target.clone());
+        if let Some(target) = target {
+            let sender = item(self.mtm(), "", None, self.ivars().story_id, &target);
+            let action = if self.ivars().action == sel!(toggleSave:)
+                && event.modifierFlags().contains(NSEventModifierFlags::Option)
+            {
+                sel!(openStory:)
+            } else if self.ivars().action == sel!(openSaved:)
+                && event.modifierFlags().contains(NSEventModifierFlags::Option)
+            {
+                sel!(openSavedComments:)
+            } else if self.ivars().action == sel!(openHistory:)
+                && event.modifierFlags().contains(NSEventModifierFlags::Option)
+            {
+                sel!(openHistoryComments:)
+            } else {
+                self.ivars().action
+            };
+            unsafe {
+                NSApplication::sharedApplication(self.mtm()).sendAction_to_from(
+                    action,
+                    Some(&target),
+                    Some(&sender),
+                );
+            }
+        }
+    }
+}
+
+fn refresh_story_views() {
+    fn refresh(menu: &NSMenu, s: &State) {
+        for item in menu.itemArray().iter() {
+            if let Some(sub) = item.submenu() {
+                refresh(&sub, s);
+            }
+            let Some(view) = item.view() else {
+                continue;
+            };
+            let Some(action) = item.action() else {
+                continue;
+            };
+            let id = item.tag() as u64;
+            let saved = action == sel!(toggleSave:) && s.saved.iter().any(|st| st.id == id);
+            let title = if action == sel!(openSaved:) && !s.saved.iter().any(|st| st.id == id) {
+                format!("{} (read)", item.title())
+            } else {
+                item.title().to_string()
+            };
+            let title = NSString::from_str(&title);
+            unsafe {
+                let _: () = msg_send![&*view, setTitle: &*title];
+                let _: () = msg_send![&*view, setStorySaved: saved];
+            }
+        }
+    }
+    STATE.with_borrow(|s| {
+        if let Some(menu) = &s.menu {
+            refresh(menu, s);
+        }
+    });
 }
 
 // ---------------------------------------------------------------- handler
 
 fn is_middle_click(mtm: MainThreadMarker) -> bool {
-    NSApplication::sharedApplication(mtm).currentEvent().is_some_and(|event| {
-        matches!(event.r#type(), NSEventType::OtherMouseDown | NSEventType::OtherMouseUp)
-            && event.buttonNumber() == 2
-    })
+    NSApplication::sharedApplication(mtm)
+        .currentEvent()
+        .is_some_and(|event| {
+            matches!(
+                event.r#type(),
+                NSEventType::OtherMouseDown | NSEventType::OtherMouseUp
+            ) && event.buttonNumber() == 2
+        })
 }
 
 define_class!(
@@ -377,8 +720,14 @@ define_class!(
     unsafe impl NSMenuDelegate for Handler {
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
-            start_fetch();
             rebuild_menu();
+            MENU_OPEN.store(true, Ordering::SeqCst);
+            start_fetch();
+        }
+        #[unsafe(method(menuDidClose:))]
+        fn menu_did_close(&self, _menu: &NSMenu) {
+            MENU_OPEN.store(false, Ordering::SeqCst);
+            DispatchQueue::main().exec_async(rebuild_menu);
         }
     }
 
@@ -401,7 +750,7 @@ define_class!(
             }
             let i = sender.tag() as usize;
             with_lists(|l| {
-                if let Some(st) = l.stories.get(i) {
+                if let Some(st) = l.stories.iter().find(|st| st.id == i as u64) {
                     if let Some(pos) = l.saved.iter().position(|x| x.id == st.id) {
                         l.saved.remove(pos);
                     } else {
@@ -419,7 +768,7 @@ define_class!(
             }
             let i = sender.tag() as usize;
             with_lists(|l| {
-                if let Some(st) = l.stories.get(i).cloned() {
+                if let Some(st) = l.stories.iter().find(|st| st.id == i as u64).cloned() {
                     l.saved.retain(|x| x.id != st.id);
                     l.read(st);
                 }
@@ -429,7 +778,7 @@ define_class!(
         #[unsafe(method(openStoryComments:))]
         fn open_story_comments(&self, sender: &NSMenuItem) {
             let i = sender.tag() as usize;
-            let url = STATE.with_borrow(|s| s.stories.get(i).map(|x| x.discussion_url()));
+            let url = STATE.with_borrow(|s| s.stories.iter().find(|st| st.id == i as u64).map(|x| x.discussion_url()));
             if let Some(url) = url {
                 open_url(&url);
             }
@@ -443,8 +792,8 @@ define_class!(
             }
             let i = sender.tag() as usize;
             with_lists(|l| {
-                if i < l.saved.len() {
-                    let st = l.saved.remove(i);
+                if let Some(index) = l.saved.iter().position(|st| st.id == i as u64) {
+                    let st = l.saved.remove(index);
                     l.read(st);
                 }
             });
@@ -453,7 +802,7 @@ define_class!(
         #[unsafe(method(openSavedComments:))]
         fn open_saved_comments(&self, sender: &NSMenuItem) {
             let i = sender.tag() as usize;
-            let url = STATE.with_borrow(|s| s.saved.get(i).map(|x| x.discussion_url()));
+            let url = STATE.with_borrow(|s| s.saved.iter().find(|st| st.id == i as u64).map(|x| x.discussion_url()));
             if let Some(url) = url {
                 open_url(&url);
             }
@@ -481,7 +830,7 @@ define_class!(
             }
             let i = sender.tag() as usize;
             with_lists(|l| {
-                if let Some(st) = l.history.get(i).cloned() {
+                if let Some(st) = l.history.iter().find(|st| st.id == i as u64).cloned() {
                     l.read(st);
                 }
             });
@@ -490,7 +839,7 @@ define_class!(
         #[unsafe(method(openHistoryComments:))]
         fn open_history_comments(&self, sender: &NSMenuItem) {
             let i = sender.tag() as usize;
-            let url = STATE.with_borrow(|s| s.history.get(i).map(|x| x.discussion_url()));
+            let url = STATE.with_borrow(|s| s.history.iter().find(|st| st.id == i as u64).map(|x| x.discussion_url()));
             if let Some(url) = url {
                 open_url(&url);
             }
@@ -504,6 +853,34 @@ define_class!(
         #[unsafe(method(openHN:))]
         fn open_hn(&self, _sender: &NSMenuItem) {
             open_url("https://news.ycombinator.com/");
+        }
+
+        #[unsafe(method(connectCloud:))]
+        fn connect_cloud(&self, _sender: &NSMenuItem) { start_backup(true); }
+
+        #[unsafe(method(openCloud:))]
+        fn open_cloud(&self, _sender: &NSMenuItem) {
+            let url = STATE.with_borrow(|s| s.connection.as_ref().map(|c| c.url()));
+            if let Some(url) = url { open_url(&url); }
+        }
+
+        #[unsafe(method(disconnectCloud:))]
+        fn disconnect_cloud(&self, _sender: &NSMenuItem) {
+            // Do not disconnect while a write is in flight.
+            if BACKING_UP.load(Ordering::SeqCst) { return; }
+            match std::fs::remove_file(data_path("github.json")) {
+                Ok(()) => STATE.with_borrow_mut(|s| { s.connection = None; s.cloud_enabled = false; s.cloud_status.clear(); }),
+                Err(e) => STATE.with_borrow_mut(|s| s.cloud_status = format!("Could not disconnect: {e}")),
+            }
+            rebuild_menu();
+        }
+
+        #[unsafe(method(signIn:))]
+        fn sign_in(&self, _sender: &NSMenuItem) {
+            if let Err(error) = cloud::sign_in() {
+                STATE.with_borrow_mut(|s| s.cloud_status = error);
+                rebuild_menu();
+            }
         }
 
         #[unsafe(method(quit:))]
@@ -521,15 +898,31 @@ impl Handler {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--connect") {
+        match cloud::backup(
+            cloud::Connection::load(),
+            &load_list("saved.json"),
+            &load_list("history.json"),
+        ) {
+            Ok(connection) => println!("{}", connection.url()),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let mtm = MainThreadMarker::new().expect("must run on main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     let handler = Handler::new(mtm);
     let menu = NSMenu::new(mtm);
+    menu.setAutoenablesItems(false);
     menu.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
 
-    let status_item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+    let status_item =
+        NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = status_item.button(mtm) {
         match NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(ICON_SVG)) {
             Some(img) => {
@@ -542,6 +935,8 @@ fn main() {
     status_item.setMenu(Some(&menu));
 
     STATE.with_borrow_mut(|s| {
+        s.connection = cloud::Connection::load();
+        s.cloud_enabled = s.connection.is_some();
         s.saved = load_list("saved.json");
         s.history = load_list("history.json");
         s.menu = Some(menu);
@@ -550,6 +945,7 @@ fn main() {
     });
     rebuild_menu();
     start_fetch();
+    start_cloud_sync();
 
     app.run();
 }
